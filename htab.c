@@ -2,13 +2,63 @@
 #include <stdarg.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
 #include "kthread.h"
 #include "yak-priv.h"
-
 #include "khashl.h" // hash table
+#include "ksort.h"
+
+#define YAK_LOAD_ALL       1
+#define YAK_LOAD_TRIOBIN1  2
+#define YAK_LOAD_TRIOBIN2  3
+
+#define YAK_MAGIC "YAK\2"
+
 #define yak_ch_eq(a, b) ((a)>>YAK_COUNTER_BITS == (b)>>YAK_COUNTER_BITS) // lower 8 bits for counts; higher bits for k-mer
 #define yak_ch_hash(a) ((a)>>YAK_COUNTER_BITS)
 KHASHL_SET_INIT(, yak_ht_t, yak_ht, uint64_t, yak_ch_hash, yak_ch_eq)
+KRADIX_SORT_INIT(u64t, uint64_t, (uint64_t), 8)
+
+
+yak_bf_t *yak_bf_init(int n_shift, int n_hashes)
+{
+	yak_bf_t *b;
+	void *ptr = 0;
+	if (n_shift + YAK_BLK_SHIFT > 64 || n_shift < YAK_BLK_SHIFT) return 0;
+	b = calloc(1, sizeof(yak_bf_t));
+	b->n_shift = n_shift;
+	b->n_hashes = n_hashes;
+	posix_memalign(&ptr, 1<<(YAK_BLK_SHIFT-3), 1ULL<<(n_shift-3));
+	b->b = ptr;
+	bzero(b->b, 1ULL<<(n_shift-3));
+	return b;
+}
+
+void yak_bf_destroy(yak_bf_t *b)
+{
+	if (b == 0) return;
+	free(b->b); free(b);
+}
+
+int yak_bf_insert(yak_bf_t *b, uint64_t hash)
+{
+	int x = b->n_shift - YAK_BLK_SHIFT;
+	uint64_t y = hash & ((1ULL<<x) - 1);
+	int h1 = hash >> x & YAK_BLK_MASK;
+	int h2 = hash >> b->n_shift & YAK_BLK_MASK;
+	uint8_t *p = &b->b[y<<(YAK_BLK_SHIFT-3)];
+	int i, z = h1, cnt = 0;
+	if ((h2&31) == 0) h2 = (h2 + 1) & YAK_BLK_MASK; // otherwise we may repeatedly use a few bits
+	for (i = 0; i < b->n_hashes; z = (z + h2) & YAK_BLK_MASK) {
+		uint8_t *q = &p[z>>3], u;
+		u = 1<<(z&7);
+		cnt += !!(*q & u);
+		*q |= u;
+		++i;
+	}
+	return cnt;
+}
+
 
 yak_ch_t *yak_ch_init(int k, int pre, int n_hash, int n_shift)
 {
@@ -283,4 +333,349 @@ yak_ch_t *yak_ch_restore_core(yak_ch_t *ch0, const char *fn, int mode, ...)
 yak_ch_t *yak_ch_restore(const char *fn)
 {
 	return yak_ch_restore_core(0, fn, YAK_LOAD_ALL);
+}
+
+
+/*
+ other usages
+*/
+
+void yam_compare_count_2D(yak_ch_t *h_asm, yak_ch_t *h_reads, int **mat, int pre){
+	khint_t k, k2;
+	uint64_t mask = (1<<YAK_COUNTER_BITS)-1, xr, xa;
+    int i, j, cnt_read, cnt_asm;
+    yak_ht_t *h, *h2;
+
+	for (i=0; i<(1<<pre)-1; i++){
+		h = h_reads->h[i].h;
+		for (k=0; k<kh_end(h); k++){
+			if (kh_exist(h, k)){
+				cnt_read = kh_key(h, k) & mask;
+				xr = kh_key(h, k)>>YAK_COUNTER_BITS<<pre;
+
+				// check if the kmer is present in assembly's hashtable
+				h2 = h_asm->h[i].h;
+				k2 = yak_ht_get(h2, xr);
+				if (k2==kh_end(h2)){
+					cnt_asm = 0;
+				}else{
+					cnt_asm = kh_key(h2, k2) & mask;
+				}
+				// update counter
+				mat[cnt_read-1][cnt_asm]++;
+				
+			}
+		}
+    }
+}
+
+void yam_compare_zero_dump(yak_ch_t *h_asm, yak_ch_t *h_reads, int kmersize, int pre){
+	khint_t k, k2;
+	uint64_t mask = (1<<YAK_COUNTER_BITS)-1, xr, xa, kmer, hash;
+    uint64_t mask_kmer = (1ULL<<kmersize*2) - 1;
+	int i, j, cnt_read, cnt_asm, ii;
+    yak_ht_t *h, *h2;
+	int *indices = (int*)calloc(YAK_MAX_COUNT+1, sizeof(int));  assert(indices);
+	char strmap[4]="ACGT";
+	char *kmer_s = (char*)malloc(kmersize);
+
+	for (i=0; i<(1<<pre)-1; i++){
+		h = h_reads->h[i].h;
+		for (k=0; k<kh_end(h); k++){
+			if (kh_exist(h, k)){
+				cnt_read = kh_key(h, k) & mask;
+				xr = kh_key(h, k)>>YAK_COUNTER_BITS<<pre;
+
+				// check if the kmer is present in assembly's hashtable
+				h2 = h_asm->h[i].h;
+				k2 = yak_ht_get(h2, xr);
+				if (k2==kh_end(h2)){
+					cnt_asm = 0;
+				}else{
+					cnt_asm = kh_key(h2, k2) & mask;
+				}
+				if (cnt_asm==0){
+					fprintf(stdout, ">rcnt%d_%d\n", cnt_read, indices[cnt_read-1]++);
+					hash = (kh_key(h, k)>>YAK_COUNTER_BITS<<pre) | (uint64_t)i;
+					kmer = yak_hash64i(hash, mask_kmer);
+					for (ii=0; ii<kmersize*2; ii+=2){
+						kmer_s[kmersize-1-ii/2] = strmap[(kmer>>ii)&3];
+					}
+					fprintf(stdout, "%.*s\n", kmersize, kmer_s);
+				}
+			}
+		}
+    }
+	free(indices);
+	free(kmer_s);
+}
+
+
+// FUNC
+//     For each kmer bucket, find the kmers that are not in the contigs,
+//      but could be found if we allow one mismatch.
+// PAR
+//     length of `buf` is $max_count + 1 
+// NOTE
+//     too slow not using this; do zerodump and bwa aln instead.
+void yam_compare_count_2D_blue1mismatch(yak_ch_t *h_asm, yak_ch_t *h_reads, 
+										int *buf, int pre, int kmersize){
+	khint_t k, k2;
+	int pre2;
+	uint64_t mask_pre = (1<<pre)-1;
+	uint64_t mask = (1<<YAK_COUNTER_BITS)-1, xr, xa, kmer;
+    int i, j, cnt_read, cnt_asm, ik;
+    yak_ht_t *h, *h2;
+
+	for (i=0; i<(1<<pre)-1; i++){
+		h = h_reads->h[i].h;
+		for (k=0; k<kh_end(h); k++){
+			if (!kh_exist(h, k)) continue;
+			cnt_read = kh_key(h, k) & mask;
+			xr = kh_key(h, k)>>YAK_COUNTER_BITS<<pre;
+
+			// check if the kmer is present in assembly's hashtable
+			h2 = h_asm->h[i].h;
+			k2 = yak_ht_get(h2, xr);
+			if (k2==kh_end(h2)){  // not in the contigs, now try with one mismatch
+				kmer = yak_hash64i(xr, mask) | (uint64_t)i;
+				int max_outcome=0;
+				for (ik=0; ik<kmersize; ik+=2){
+					xr = xr^(1ULL<<ik);  // mutation 1
+					pre2 = xr & mask_pre;
+					h2 = h_asm->h[pre2].h;
+					k2 = yak_ht_get(h2, xr>>pre<<YAK_COUNTER_BITS);
+					if (k2!=kh_end(h2)){
+						cnt_asm = kh_key(h2, k2) & YAK_MAX_COUNT;
+						max_outcome = cnt_asm>max_outcome? cnt_asm : max_outcome; 
+					}
+					
+					xr = xr^(1ULL<<(ik+1));  // mutation 2
+					pre2 = xr & mask_pre;
+					h2 = h_asm->h[pre2].h;
+					k2 = yak_ht_get(h2, xr>>pre<<YAK_COUNTER_BITS);
+					if (k2!=kh_end(h2)){
+						cnt_asm = kh_key(h2, k2) & YAK_MAX_COUNT;
+						max_outcome = cnt_asm>max_outcome? cnt_asm : max_outcome; 
+					}
+
+					xr = xr^(1ULL<<ik);  // mutaiton 3
+					pre2 = xr & mask_pre;
+					h2 = h_asm->h[pre2].h;
+					k2 = yak_ht_get(h2, xr>>pre<<YAK_COUNTER_BITS);
+					if (k2!=kh_end(h2)){
+						cnt_asm = kh_key(h2, k2) & YAK_MAX_COUNT;
+						max_outcome = cnt_asm>max_outcome? cnt_asm : max_outcome; 
+					}
+				}
+				buf[max_outcome]++;
+			}
+		}
+	}
+
+}
+
+yak_ht_t *yam_compare_get_kmers_of_interest(yak_ch_t *h_asm, yak_ch_t *h_reads, int pre,
+											int read_low, int read_high, int asm_low, int asm_high){
+    yak_ht_t *hret = yak_ht_init();
+	double time = Get_T();
+	khint_t k, k2;
+	uint64_t mask = (1<<YAK_COUNTER_BITS)-1, x, xr, xa;
+	int i, j, cnt_read, cnt_asm, absent;
+	yak_ht_t *h, *h2;
+
+	int sancheck_counter = 0;
+	for (i=0; i<(1<<pre)-1; i++){
+		h = h_reads->h[i].h;
+		for (k=0; k!=kh_end(h); k++){
+			if (kh_exist(h, k)){
+				cnt_read = kh_key(h, k) & mask;
+				if (cnt_read<read_low || cnt_read>=read_high) continue; 
+				xr = kh_key(h, k)>>YAK_COUNTER_BITS<<pre;
+
+				// check if the kmer is present in assembly's hashtable
+				h2 = h_asm->h[i].h;
+				k2 = yak_ht_get(h2, xr);
+				if (k2==kh_end(h2)){
+					cnt_asm = 0;
+				}else{
+					cnt_asm = kh_key(h2, k2) & mask;
+				}
+				if (cnt_asm<asm_low || cnt_asm>=asm_high) continue;
+
+				// plug
+				x = ((kh_key(h, k)>>YAK_COUNTER_BITS)<<pre) | ((uint64_t)i);
+				yak_ht_put(hret, x, &absent);
+				// assert(absent==1);  // must not have been put, since each kmer could only belong to one place. 
+				sancheck_counter++;
+			}
+		}
+	}
+	fprintf(stderr, "[M::%s] collected %d kmers of interest, used %.2fs\n", 
+					 __func__, sancheck_counter, Get_T()-time);
+
+	return hret;
+}
+
+// FUNC
+//     Simply count kmers of a seq and return a hashtable.
+yak_ht_t *yam_count_seq(char *seq, int seq_l, int32_t k, int *n_distinct){
+	yak_ht_t *h = yak_ht_init();
+	int i, l, absent, tot=0;
+	uint64_t x[2], hash, mask = (1ULL<<k*2) - 1, shift = (k - 1) * 2;
+	khint_t key;
+	for (i = l = 0, x[0] = x[1] = 0; i < seq_l; ++i) {
+		int c = seq_nt4_table[(uint8_t)seq[i]];
+		if (c < 4) { // not an "N" base
+			x[0] = (x[0] << 2 | c) & mask;                  // forward strand
+			x[1] = x[1] >> 2 | (uint64_t)(3 - c) << shift;  // reverse strand
+			if (++l >= k) { // we find a k-mer
+				uint64_t y = x[0] < x[1]? x[0] : x[1];
+				hash = yak_hash64(y, mask);
+				yak_ht_put(h, hash, &absent);
+				if (absent) tot++;
+			}
+		} else l = 0, x[0] = x[1] = 0; // if there is an "N", restart
+	}
+	*n_distinct = tot;
+	return h;
+}
+
+
+// FUNC
+//     Comparison mode2 core.
+//     `h` contains only the desired kmers.
+int yam_compare_count_hits_given_seq_and_ht(yak_ht_t *h, char *seq, int seq_l, int32_t k){
+	int ret = 0, i, l;
+	uint64_t x[2], hash, mask = (1ULL<<k*2) - 1, shift = (k - 1) * 2;
+	khint_t key;
+	for (i = l = 0, x[0] = x[1] = 0; i < seq_l; ++i) {
+		int c = seq_nt4_table[(uint8_t)seq[i]];
+		if (c < 4) { // not an "N" base
+			x[0] = (x[0] << 2 | c) & mask;                  // forward strand
+			x[1] = x[1] >> 2 | (uint64_t)(3 - c) << shift;  // reverse strand
+			if (++l >= k) { // we find a k-mer
+				uint64_t y = x[0] < x[1]? x[0] : x[1];
+				hash = yak_hash64(y, mask);
+				key = yak_ht_get(h, hash);
+				if (key!=kh_end(h))
+					ret++;
+			}
+		} else l = 0, x[0] = x[1] = 0; // if there is an "N", restart
+	}
+	return ret;
+}
+
+// FUNC
+//     Comparison mode2, write BED formatted lines for IGV eyeballing 
+//      the kmer locations on the given contigs.
+// PAR
+//     `h` contains only the desired kmers.
+//     `l_gap` for the threshold of merging two blocks
+int yam_compare_count_bed_given_seq_and_ht(FILE *fp, yak_ht_t *h, 
+										  char *seq, int seq_l, 
+										  char *seqname, int seqname_l, 
+										  int32_t k, int l_gap){
+	int n_blocks = 0, n_bp=0;
+	int prv_end=0, start=0, end=0;
+	int i, l;
+	uint64_t x[2], hash, mask = (1ULL<<k*2) - 1, shift = (k - 1) * 2;
+	khint_t key;
+	for (i = l = 0, x[0] = x[1] = 0; i < seq_l; ++i) {
+		int c = seq_nt4_table[(uint8_t)seq[i]];
+		if (c < 4) { // not an "N" base
+			x[0] = (x[0] << 2 | c) & mask;                  // forward strand
+			x[1] = x[1] >> 2 | (uint64_t)(3 - c) << shift;  // reverse strand
+			if (++l >= k) { // we find a k-mer
+				uint64_t y = x[0] < x[1]? x[0] : x[1];
+				hash = yak_hash64(y, mask);
+				key = yak_ht_get(h, hash);
+				if (key!=kh_end(h)){  // valid kmer
+					if (prv_end+l_gap+k>=i){  // small gap
+						prv_end = i;
+						end = i;
+					}else{  // large gap, flush and update
+						fprintf(fp, "%.*s\t%d\t%d\n", seqname_l, seqname, start, end);
+						n_bp += end-start;
+						start = i-k;
+						end = i;
+						prv_end = i;
+						n_blocks++;
+					}
+				}
+			}
+		} else l = 0, x[0] = x[1] = 0; // if there is an "N", restart
+	}
+	if (end>start){
+		fprintf(fp, "%.*s\t%d\t%d\n", seqname_l, seqname, start, end);
+		n_bp += end-start;
+		n_blocks++;
+	}
+	fprintf(stderr, "[M::%s] wrote %d blocks, cover %d bp (out of %d).\n", __func__, n_blocks, n_bp, seq_l);
+	return n_blocks;
+}
+
+
+void yam_ht_destroy(yak_ht_t *h){
+	yak_ht_destroy(h);
+}
+
+
+// FUNC
+//     Collect bottom minhash sketch of a sequence.
+vec_u64t yam_minhash_sketch(char *seq, int seq_l, int kmersize, int n_hash){
+	int h_size = 0, n=0, i;
+	yak_ht_t *h = yam_count_seq(seq, seq_l, kmersize, &h_size);
+	uint64_t *buf = (uint64_t*)malloc(sizeof(uint64_t)*h_size);
+	vec_u64t ret; 
+	kv_init(ret);
+	kv_resize(uint64_t, ret, n_hash);
+
+	khint_t k;
+	uint64_t hash;
+	for (k=0; k<kh_end(h); k++){
+		if (kh_exist(h, k)){
+			hash = kh_key(h, k);
+			buf[n++] = hash;
+		}
+	}
+	radix_sort_u64t(buf, buf+n);
+	for (i=0; i<n_hash; i++){
+		kv_push(uint64_t, ret, buf[i]);
+	}
+	
+	free(buf);
+	yak_ht_destroy(h);
+	return ret;
+}
+
+
+// FUNC
+//     mash distance: ANI estimation using Jaccard estimator. 
+//     See Ondov et al (2016) equation 4.
+double yam_minhash_mashdist_core(vec_u64t *h1, vec_u64t *h2, int k, int n_hash, int *ret_share){
+	double jaccard, dist;
+	int tot=0, share=0, i1=0, i2=0, n=h1->n, which=1; 
+	assert(h1->n==h2->n);
+	while (i1<n && i2<n){
+		if (h1->a[i1]==h2->a[i2]){
+			share++;
+			i1++;
+			i2++;
+		}else if (h1->a[i1]>h2->a[i2]){
+			i2++;
+		}else{
+			i1++;
+		}
+		tot++;
+		if (tot==n_hash) break;
+	}
+	if (share==0) dist=1;
+	else if (share==n_hash) dist=+0;
+	else{
+		jaccard = (double)share/n_hash;
+		dist = -1.0/(double)k * log(2*jaccard/(1+jaccard));
+	}
+	if (ret_share) *ret_share = share;
+	return dist;
 }
